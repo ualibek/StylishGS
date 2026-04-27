@@ -92,6 +92,13 @@ class Scene:
 
         with open(os.path.join(self.model_path, "exposure.json"), "w") as f:
             json.dump(exposure_dict, f, indent=2)
+    
+    def save_retrained(self, output_path: str, iteration: int):
+        # Save Gaussians (changes every checkpoint)
+        ply_dir = os.path.join(output_path, f"point_cloud/iteration_{iteration}")
+        os.makedirs(ply_dir, exist_ok=True)
+        self.gaussians.save_ply(os.path.join(ply_dir, "point_cloud.ply"))
+        print(f"Saved checkpoint at iteration {iteration}")
 
     def getTrainCameras(self, scale=1.0):
         return self.train_cameras[scale]
