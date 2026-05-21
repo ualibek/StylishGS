@@ -16,15 +16,15 @@ import os
 import sys
 import argparse
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-
 import torch
 import torch.nn.functional as F
 from PIL import Image
 import torchvision.transforms as T
 from tqdm import tqdm
 
-from arguments            import ModelParams, PipelineParams
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from arguments            import ModelParams, PipelineParams, OptimizationParams
 from gaussian_renderer    import render
 from scene                import Scene
 from scene.gaussian_model import GaussianModel
@@ -35,44 +35,14 @@ from style_transfer.style_loss        import VGGFeatures, normalize_for_vgg, pre
 from style_transfer.camera_sampler    import TrainCameraSampler
 from style_transfer.reference_renders import ReferenceRenderCache
 
-import matplotlib.pyplot as plt
-
 # ── Hardcoded hyperparameters ─────────────────────────────────────────────────
-ITERATIONS     = 100
-VIEWS_PER_STEP = 4
+ITERATIONS     = 2000
+VIEWS_PER_STEP = 2
 LAMBDA_STYLE   = 1e4
 LR             = 1e-3
 VGG_MAX_DIM    = 512
-SAVE_EVERY     = ITERATIONS // 4
+SAVE_EVERY     = ITERATIONS
 # ─────────────────────────────────────────────────────────────────────────────
-
-# helper functions
-
-def save_loss_curves(l1_losses, style_losses, total_losses, out_dir="visualizations"):
-    steps = range(1, len(l1_losses) + 1)
-
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-
-    axes[0].plot(steps, l1_losses, color="steelblue")
-    axes[0].set_title("L1 Loss")
-    axes[0].set_xlabel("Step")
-
-    axes[1].plot(steps, style_losses, color="darkorange")
-    axes[1].set_title("Style Loss")
-    axes[1].set_xlabel("Step")
-
-    axes[2].plot(steps, total_losses, color="seagreen")
-    axes[2].set_title("Total Loss")
-    axes[2].set_xlabel("Step")
-
-    for ax in axes:
-        ax.grid(True, alpha=0.3)
-
-    os.makedirs(out_dir, exist_ok=True)
-    plt.tight_layout()
-    plt.savefig(os.path.join(out_dir, "loss_curves.png"), dpi=150)
-    plt.close()
-
 def copy_meta(src_model_path: str, dst_path: str):
     """
     Copy static SIBR meta files from a pretrained scene to the output folder.
@@ -85,7 +55,6 @@ def copy_meta(src_model_path: str, dst_path: str):
         if os.path.exists(src):
             shutil.copy(src, os.path.join(dst_path, fname))
     print(f"Copied meta files from {src_model_path} to {dst_path}")
-
 
 def train_style(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -105,9 +74,9 @@ def train_style(args):
     print(f"Loaded {gaussians.get_xyz.shape[0]:,} Gaussians.")
 
     # ── Freeze geometry, only train SH colour ────────────────────────────────
-    gaussians._xyz.requires_grad_(True)
-    gaussians._scaling.requires_grad_(True)
-    gaussians._rotation.requires_grad_(True)
+    gaussians._xyz.requires_grad_(False)
+    gaussians._scaling.requires_grad_(False)
+    gaussians._rotation.requires_grad_(False)
     gaussians._opacity.requires_grad_(False)
     gaussians._features_dc.requires_grad_(True)
     gaussians._features_rest.requires_grad_(True)
@@ -115,9 +84,6 @@ def train_style(args):
     optimizer = torch.optim.Adam([
         {"params": gaussians._features_dc},
         {"params": gaussians._features_rest},
-        {"params": gaussians._scaling},
-        {"params": gaussians._rotation},
-        {"params": gaussians._xyz}
     ], lr=LR, eps=1e-15)
 
     # ── Precompute reference renders ──────────────────────────────────────────
@@ -132,55 +98,34 @@ def train_style(args):
 
     # ── Training loop ─────────────────────────────────────────────────────────
     sampler = TrainCameraSampler(train_cameras)
-    out_dir = f"{args.model_path}_styled"
-    num = 0
-    while os.path.exists(f"{out_dir}{num}"):
-        num += 1
-    out_dir = f"{out_dir}{num}"
+    out_dir = args.model_path + "_styled"
     os.makedirs(out_dir, exist_ok=True)
 
     copy_meta(scene.model_path, out_dir)
 
-    l1_losses = []
-    style_losses = []
-    total_losses = []
-
-    pbar = tqdm(range(1, ITERATIONS + 1), desc="Style transfer")
-    for step in pbar:
+    for step in tqdm(range(1, ITERATIONS + 1), desc="Style transfer"):
         optimizer.zero_grad()
-        total_l1    = torch.tensor(0.0, device=device)
-        total_style = torch.tensor(0.0, device=device)
         total_loss = torch.tensor(0.0, device=device)
 
         for cam in sampler.sample(VIEWS_PER_STEP):
             rendered = render(cam, gaussians, pp, background)["render"].clamp(0, 1)
             ref      = ref_cache[cam].to(device)
 
-            Ll1    = l1_loss(rendered, ref)
+            # Ll1    = l1_loss(rendered, ref)
             r_vgg  = normalize_for_vgg(F.interpolate(rendered.unsqueeze(0), size=VGG_MAX_DIM))
             Lstyle = compute_style_loss(vgg(r_vgg), style_grams)
 
-            total_l1    += Ll1.detach()
-            total_style += Lstyle.detach()
-            total_loss = total_loss + Ll1 + LAMBDA_STYLE * Lstyle
+            total_loss = total_loss + LAMBDA_STYLE * Lstyle
 
         (total_loss / VIEWS_PER_STEP).backward()
         optimizer.step()
 
-        l1_losses.append((total_l1 / VIEWS_PER_STEP).item())
-        style_losses.append((total_style / VIEWS_PER_STEP).item())
-        total_losses.append((total_loss.detach() / VIEWS_PER_STEP).item())
-
-        pbar.set_postfix({
-            "L1": f"{(total_l1 / VIEWS_PER_STEP).item():.4f}",
-            "style": f"{(total_style / VIEWS_PER_STEP).item():.6f}",
-            "total": f"{(total_loss.detach() / VIEWS_PER_STEP).item():.4f}",
-        })
-
         if step % SAVE_EVERY == 0 or step == ITERATIONS:
-            scene.save_retrained(out_dir, step)
+            ckpt = os.path.join(out_dir, f"point_cloud/iteration_{step}")
+            os.makedirs(ckpt, exist_ok=True)
+            gaussians.save_ply(os.path.join(ckpt, "point_cloud.ply"))
+            tqdm.write(f"Saved checkpoint at step {step}")
 
-    save_loss_curves(l1_losses, style_losses, total_losses)
     print(f"Done. Stylised scene saved to {out_dir}")
 
 
